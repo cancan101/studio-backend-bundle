@@ -15,6 +15,7 @@ namespace Pimcore\Bundle\StudioBackendBundle\Grid\Service;
 
 use Pimcore\Bundle\StudioBackendBundle\Exception\Api\InvalidArgumentException;
 use Pimcore\Bundle\StudioBackendBundle\Grid\Column\ClassIdInterface;
+use Pimcore\Bundle\StudioBackendBundle\Grid\Column\FieldDefinitionAwareColumnDefinitionInterface;
 use Pimcore\Bundle\StudioBackendBundle\Grid\Column\FolderIdInterface;
 use Pimcore\Bundle\StudioBackendBundle\Grid\Column\UseUserInterface;
 use Pimcore\Bundle\StudioBackendBundle\Grid\Event\GridColumnConfigurationEvent;
@@ -161,17 +162,23 @@ final readonly class ColumnConfigurationService implements ColumnConfigurationSe
             );
         }
 
+        $columnDefinition = $availableColumnDefinitions[$columnDefinitionType];
+
         return new ColumnConfiguration(
             key: $key,
             group: $definition->getGroup(),
-            sortable: $availableColumnDefinitions[$columnDefinitionType]->isSortable(),
+            sortable: $columnDefinition instanceof FieldDefinitionAwareColumnDefinitionInterface
+                ? $columnDefinition->isSortableForFieldDefinition($fieldDefinition)
+                : $columnDefinition->isSortable(),
             editable: !$fieldDefinition->getNoteditable(),
-            exportable: $availableColumnDefinitions[$columnDefinitionType]->isExportable(),
-            filterable: $availableColumnDefinitions[$columnDefinitionType]->isFilterable(),
+            exportable: $columnDefinition->isExportable(),
+            filterable: $columnDefinition instanceof FieldDefinitionAwareColumnDefinitionInterface
+                ? $columnDefinition->isFilterableForFieldDefinition($fieldDefinition)
+                : $columnDefinition->isFilterable(),
             localizable: $definition->isLocalized(),
             locale: null,
             type: $type,
-            frontendType: $availableColumnDefinitions[$columnDefinitionType]->getFrontendType(),
+            frontendType: $columnDefinition->getFrontendType(),
             config: $config
         );
     }
