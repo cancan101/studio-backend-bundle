@@ -14,11 +14,15 @@ declare(strict_types=1);
 namespace Pimcore\Bundle\StudioBackendBundle\Grid\Column\Definition\DataObject;
 
 use Override;
+use Pimcore\Bundle\StudioBackendBundle\Grid\Column\FieldDefinitionAwareColumnDefinitionInterface;
+use Pimcore\Model\DataObject\ClassDefinition\Data;
+use Pimcore\Model\DataObject\ClassDefinition\Data\CalculatedValue;
 
 /**
  * @internal
  */
-final readonly class CalculatedValueDefinition extends AbstractDefinition
+final readonly class CalculatedValueDefinition extends AbstractDefinition implements
+    FieldDefinitionAwareColumnDefinitionInterface
 {
     public function getType(): string
     {
@@ -40,5 +44,27 @@ final readonly class CalculatedValueDefinition extends AbstractDefinition
     public function isFilterable(): bool
     {
         return false;
+    }
+
+    public function isFilterableForFieldDefinition(Data $fieldDefinition): bool
+    {
+        return $this->isSafeForFiltering($fieldDefinition);
+    }
+
+    public function isSortableForFieldDefinition(Data $fieldDefinition): bool
+    {
+        return $this->isSafeForFiltering($fieldDefinition);
+    }
+
+    /**
+     * Calculated value snapshots are only trustworthy for querying when the field is declared
+     * safe for filtering; the declaration requires a pimcore version whose CalculatedValue
+     * definition carries the flag, hence the method_exists guard.
+     */
+    private function isSafeForFiltering(Data $fieldDefinition): bool
+    {
+        return $fieldDefinition instanceof CalculatedValue
+            && method_exists($fieldDefinition, 'getSafeForFiltering')
+            && $fieldDefinition->getSafeForFiltering();
     }
 }
