@@ -24,7 +24,6 @@ use Pimcore\Bundle\StudioBackendBundle\DataObject\Data\DataInheritanceInterface;
 use Pimcore\Bundle\StudioBackendBundle\DataObject\Data\DataNormalizerInterface;
 use Pimcore\Bundle\StudioBackendBundle\DataObject\Data\DetailDataInterface;
 use Pimcore\Bundle\StudioBackendBundle\DataObject\Data\Model\FieldContextData;
-use Pimcore\Bundle\StudioBackendBundle\DataObject\Data\Model\InheritanceData;
 use Pimcore\Bundle\StudioBackendBundle\DataObject\Data\SearchPreviewDataInterface;
 use Pimcore\Bundle\StudioBackendBundle\DataObject\Data\SetterDataInterface;
 use Pimcore\Bundle\StudioBackendBundle\DataObject\Service\DataAdapterLoaderInterface;
@@ -163,26 +162,25 @@ final readonly class ClassificationStoreAdapter implements
         $languages = $this->getValidLanguages($object, $fieldDefinition->isLocalized());
         $collection = $this->getStoreDefinitions($object, $fieldDefinition);
         if (empty($collection)) {
-            $originId = $this->inheritanceService->getOriginId($object, $fieldDefinition, $key, $contextData);
-
-            return [new InheritanceData($originId, $originId !== $object->getId())];
+            return [
+                $this->inheritanceService->getFieldInheritanceData($object, $fieldDefinition, $key, $contextData),
+            ];
         }
 
         $container = $this->getContainer($object, $key, $contextData);
+        $resolveInheritedValue = $contextData?->shouldResolveInheritedValue() ?? false;
         foreach ($collection as $groupId => $groupDefinitions) {
             foreach ($groupDefinitions as $groupKeyId => $definition) {
                 foreach ($languages as $language) {
-                    $originId = $this->inheritanceService->getOriginId(
-                        $object,
-                        $definition,
-                        $key,
-                        new FieldContextData($container, $language, $groupId, $groupKeyId)
+                    $fieldContextData = new FieldContextData(
+                        $container,
+                        $language,
+                        $groupId,
+                        $groupKeyId,
+                        resolveInheritedValue: $resolveInheritedValue
                     );
-
-                    $inheritedData[$groupId][$language][$groupKeyId] = new InheritanceData(
-                        $originId,
-                        $originId !== $object->getId()
-                    );
+                    $inheritedData[$groupId][$language][$groupKeyId] = $this->inheritanceService
+                        ->getFieldInheritanceData($object, $definition, $key, $fieldContextData);
                 }
             }
         }
@@ -307,18 +305,16 @@ final readonly class ClassificationStoreAdapter implements
         bool $isPatch
     ): void {
 
+        $editableLanguages = $this->getValidLanguages(
+            $element,
+            $definition->isLocalized(),
+            ElementPermissions::LANGUAGE_EDIT_PERMISSIONS,
+            $user
+        );
+
         foreach ($store as $groupId => $groupData) {
             foreach ($groupData as $language => $keys) {
-                if (!in_array(
-                    $language,
-                    $this->getValidLanguages(
-                        $element,
-                        $definition->isLocalized(),
-                        ElementPermissions::LANGUAGE_EDIT_PERMISSIONS,
-                        $user
-                    ),
-                    true
-                )) {
+                if (!in_array($language, $editableLanguages, true)) {
                     continue;
                 }
                 $this->processGroupKeys($element, $user, $definition, $container, $language, $groupId, $keys, $isPatch);
@@ -449,7 +445,7 @@ final readonly class ClassificationStoreAdapter implements
             return array_merge($languages, $this->toolResolver->getValidLanguages());
         }
 
-        return $this->languageService->getUserAllowedLanguages(
+        return $this->languageService->getUserAllowedLanguagesWithLanguageIndependentValue(
             $object,
             $user,
             $permissionType

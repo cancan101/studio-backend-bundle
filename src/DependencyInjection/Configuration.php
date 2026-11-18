@@ -14,22 +14,32 @@ declare(strict_types=1);
 namespace Pimcore\Bundle\StudioBackendBundle\DependencyInjection;
 
 use Pimcore\Bundle\CoreBundle\DependencyInjection\ConfigurationHelper;
+use Pimcore\Bundle\StudioBackendBundle\Asset\Encoder\TextEncoderInterface;
 use Pimcore\Bundle\StudioBackendBundle\Exception\InvalidHostException;
+use Pimcore\Bundle\StudioBackendBundle\Mcp\McpPath;
+use Pimcore\Bundle\StudioBackendBundle\OAuth\Util\CanonicalUri;
 use Pimcore\Bundle\StudioBackendBundle\Perspective\Util\Constant\WidgetTypes;
 use Pimcore\Bundle\StudioBackendBundle\Setting\Admin\Repository\SettingRepository;
 use Pimcore\Bundle\StudioBackendBundle\Util\Config\ConfigKeyMapper;
 use Pimcore\Bundle\StudioBackendBundle\Util\Constant\Asset\DownloadLimits;
 use Pimcore\Bundle\StudioBackendBundle\Util\Constant\Asset\MimeTypes;
 use Pimcore\Bundle\StudioBackendBundle\Util\Constant\Asset\ResizeModes;
+use Pimcore\Bundle\StudioBackendBundle\Util\Constant\Document\DocumentTypes;
 use Pimcore\Bundle\StudioBackendBundle\Util\Constant\ElementIconTypes;
 use Pimcore\Bundle\StudioBackendBundle\Util\Constant\ElementTypes;
 use Symfony\Component\Config\Definition\Builder\ArrayNodeDefinition;
 use Symfony\Component\Config\Definition\Builder\TreeBuilder;
 use Symfony\Component\Config\Definition\ConfigurationInterface;
+use function array_diff;
+use function array_filter;
+use function array_keys;
+use function implode;
+use function in_array;
 use function is_array;
 use function is_int;
 use function is_null;
 use function is_string;
+use function preg_match;
 use function sprintf;
 
 /**
@@ -45,11 +55,40 @@ class Configuration implements ConfigurationInterface
 
     public const string ADMIN_SETTINGS_NODE = 'admin_settings';
 
+    public const string TWO_FACTOR_AUTHENTICATION_NODE = 'two_factor_authentication';
+
     public const string TREE_WIDGETS_NODE = WidgetTypes::ELEMENT_TREE->value . '_widgets';
+
+    public const string MCP_SERVERS_NODE = 'studio_mcp_servers';
 
     private const string WIDGETS_ARRAY_VALUE_ERROR = 'Each widget id value must be a string.';
 
+    private const string DOCUMENT_DEFAULT_CONTROLLERS_TYPE_ERROR =
+        'pimcore_studio_backend.documents.default_controllers only accepts the document types that are rendered '
+        . 'by a controller (%s); got %%s.';
+
     private const string PERMISSION_ARRAY_VALUE_ERROR = 'Each permission value must be a boolean.';
+
+    private const string OAUTH_KEYS_REQUIRED_ERROR =
+        'pimcore_studio_backend.oauth.keys.private_key, .public_key and .encryption_key must all be set '
+        . 'when oauth.enabled is true. Without them AuthorizationServerFactory cannot build the server, '
+        . 'and the failure surfaces as an uncaught 500 on the public /pimcore-oauth/authorize endpoint '
+        . 'rather than as a configuration error. See the "Generating keys" section of the OAuth docs.';
+
+    private const string OAUTH_ISSUER_INVALID_ERROR =
+        'pimcore_studio_backend.oauth.issuer must be a bare origin: scheme, host and optional port, '
+        . 'nothing else. Write it as "https://pimcore.example.com" - lowercase host, no trailing slash, '
+        . 'no path, no query and no fragment, and http only for local development. Root paths such as '
+        . '/pimcore-mcp and /.well-known/... are appended to this value, so anything further in it '
+        . 'produces a double slash or an unusable resource URI, and a non-canonical spelling stops '
+        . 'matching the audience the resource server compares against.';
+
+    private const string OAUTH_ISSUER_REQUIRED_ERROR =
+        'pimcore_studio_backend.oauth.issuer must be set when oauth.enabled is true, '
+        . 'e.g. "https://pimcore.example.com". It is the one identity the server is '
+        . 'known by: discovery advertises it, the authorization response carries it, '
+        . 'issued tokens are stamped with it, and the resource server verifies it '
+        . 'against it. Deriving it per request would let those disagree.';
 
     /**
      * {@inheritdoc}
@@ -71,6 +110,7 @@ class Configuration implements ConfigurationInterface
         $this->addRecycleBinThreshold($rootNode);
         $this->addMercureConfiguration($rootNode);
         $this->addAssetDownloadLimits($rootNode);
+        $this->addAssetTextSettings($rootNode);
         $this->addCsvSettings($rootNode);
         $this->addGridConfiguration($rootNode);
         $this->addSearchGridConfiguration($rootNode);
@@ -85,10 +125,14 @@ class Configuration implements ConfigurationInterface
         $this->addPerspectivesConfigurationNode($rootNode);
         $this->addElementTreeWidgetConfigurationNode($rootNode);
         $this->addDefaultFromEmail($rootNode);
+        $this->addDocumentsNode($rootNode);
         $this->addGdprDataExtractorNode($rootNode);
         $this->addAdminSettingsNode($rootNode);
         $this->addMcpNode($rootNode);
+        $this->addMcpServersConfigurationNode($rootNode);
+        $this->addOAuthNode($rootNode);
         $this->addRateLimitingNode($rootNode);
+        $this->addTwoFactorAuthenticationNode($rootNode);
         $this->addTranslation($rootNode);
         $rootNode->append($this->addTwigSandboxNode());
 
@@ -101,6 +145,8 @@ class Configuration implements ConfigurationInterface
                     PIMCORE_CONFIGURATION_DIRECTORY . '/' . self::PERSPECTIVES_NODE,
                 self::ADMIN_SETTINGS_NODE =>
                     PIMCORE_CONFIGURATION_DIRECTORY . '/' . SettingRepository::SCOPE,
+                self::MCP_SERVERS_NODE =>
+                    PIMCORE_CONFIGURATION_DIRECTORY . '/' . self::MCP_SERVERS_NODE,
             ],
             ['read_target']
         );
@@ -290,11 +336,12 @@ class Configuration implements ConfigurationInterface
                 ->children()
                     ->scalarNode('hub_url_server')
                         ->info(
-                            'The url to the mercure hub for the server.' .
-                            'This can also be the docker container name '.
-                            '(e.g., http://mercure/.well-known/mercure). ' .
-                            'If it is not set, default will be set to ' .
-                            '"http(s)://<YOUR_PIMCORE_MAIN_DOMAIN>/hub/.well-known/mercure".'
+                            'The url to the mercure hub for the server. ' .
+                            'This setting must be set and has no default, because the server url ' .
+                            'cannot be derived from the browser request. ' .
+                            'It is not checked at boot; when it is empty, no updates are published. ' .
+                            'This can also be the docker container name ' .
+                            '(e.g., http://mercure/.well-known/mercure).'
                         )
                         ->defaultNull()
                     ->end()
@@ -341,6 +388,21 @@ class Configuration implements ConfigurationInterface
                     ->integerNode(DownloadLimits::MAX_ZIP_FILE_AMOUNT->value)
                         ->info('The maximum amount of assets that can be downloaded at once.')
                         ->defaultValue(1000)
+                    ->end()
+                ->end()
+            ->end();
+    }
+
+    private function addAssetTextSettings(ArrayNodeDefinition $node): void
+    {
+        $node->children()
+            ->arrayNode('asset_text_settings')
+                ->addDefaultsIfNotSet()
+                ->children()
+                    ->integerNode('max_file_size')
+                        ->info('The maximum size in bytes of a text asset that Studio loads for preview and editing.')
+                        ->defaultValue(TextEncoderInterface::DEFAULT_MAX_FILE_SIZE)
+                        ->min(1)
                     ->end()
                 ->end()
             ->end();
@@ -778,6 +840,13 @@ class Configuration implements ConfigurationInterface
                                     'Map of Pimcore username to bearer token list. '
                                     . 'Tokens can reference env vars: \'%%env(MY_TOKEN)%%\'.'
                                 )
+                                ->setDeprecated(
+                                    'pimcore/studio-backend-bundle',
+                                    '2026.4',
+                                    'Static MCP personal access tokens are deprecated and will be removed in 2027.1. '
+                                    . 'Use OAuth (authorization_code for people, client_credentials for service users) '
+                                    . 'or MCP access tokens.'
+                                )
                                 ->useAttributeAsKey('username')
                                 ->arrayPrototype()
                                     ->scalarPrototype()->end()
@@ -790,12 +859,408 @@ class Configuration implements ConfigurationInterface
         ->end();
     }
 
+    /**
+     * MCP server definitions: named tool groups exposed at /pimcore-mcp/studio/{id}.
+     * Shipped defaults live here; runtime-managed servers use the write target
+     * configured under config_location.studio_mcp_servers. The id is the URL slug,
+     * so it has to be one the route accepts.
+     */
+    private function addMcpServersConfigurationNode(ArrayNodeDefinition $node): void
+    {
+        $node->children()
+            ->arrayNode(self::MCP_SERVERS_NODE)
+                ->info('MCP server definitions, keyed by server id, which is also the URL slug.')
+                ->defaultValue([])
+                ->useAttributeAsKey('id')
+                // The id is the URL slug, and slugs use hyphens. Without this Symfony rewrites
+                // `test-server` to `test_server` on load: an id the route cannot serve.
+                ->normalizeKeys(false)
+                ->validate()
+                    ->ifTrue(static fn (array $servers): bool => array_filter(
+                        array_keys($servers),
+                        static fn (int|string $id): bool => preg_match(McpPath::STUDIO_SLUG_PATTERN, (string) $id) !== 1
+                    ) !== [])
+                    ->thenInvalid('MCP server ids are their URL slug and may only contain a-z, 0-9 and hyphens: %s')
+                ->end()
+                ->arrayPrototype()
+                    ->children()
+                        ->scalarNode('name')
+                            ->info('Human-facing display name; defaults to the id.')
+                            ->defaultNull()
+                        ->end()
+                        ->scalarNode('description')
+                            ->defaultValue('')
+                        ->end()
+                        ->arrayNode('tools')
+                            ->info('Ids of the assigned MCP tools.')
+                            ->scalarPrototype()->end()
+                            ->defaultValue([])
+                        ->end()
+                        ->arrayNode('scopes')
+                            ->info('OAuth scopes advertised for this server (e.g. mcp:read, mcp:write).')
+                            ->scalarPrototype()->end()
+                            ->defaultValue([])
+                        ->end()
+                        ->booleanNode('enabled')
+                            ->defaultTrue()
+                        ->end()
+                        ->arrayNode('access')
+                            ->addDefaultsIfNotSet()
+                            ->info('Who may access the server: owner (username) + public flag + user/role grants.')
+                            ->children()
+                                ->scalarNode('owner')
+                                    ->info(
+                                        'Creator username. Implicitly holds Config Read and Config Edit; '
+                                        . 'MCP Server Access must be granted explicitly. Names, not ids.'
+                                    )
+                                    ->defaultNull()
+                                ->end()
+                                ->booleanNode('share_global')
+                                    ->info('Public: any authenticated user may view and use the server (not edit).')
+                                    ->defaultFalse()
+                                ->end()
+                                ->append($this->mcpAccessGrantListNode('shared_users', 'Users granted access.'))
+                                ->append($this->mcpAccessGrantListNode('shared_roles', 'Roles granted access.'))
+                            ->end()
+                        ->end()
+                    ->end()
+                ->end()
+            ->end()
+        ->end();
+    }
+
+    /**
+     * A list of access grants keyed by unique name — the file-config equivalent
+     * of the settings-store {name, can_read, can_access, can_edit} grid. A bare string is
+     * accepted as a read-only grant (name only), matching {@see McpServerAccessEntry::fromMixed()}.
+     */
+    private function mcpAccessGrantListNode(string $name, string $info): ArrayNodeDefinition
+    {
+        $node = (new TreeBuilder($name))->getRootNode();
+        $node
+            ->info($info)
+            ->arrayPrototype()
+                ->beforeNormalization()
+                    ->ifString()
+                    ->then(static fn (string $value): array => ['name' => $value])
+                ->end()
+                ->children()
+                    ->scalarNode('name')->isRequired()->cannotBeEmpty()->end()
+                    // Defaults to true, matching McpServerAccessEntry::fromMixed(): a grant
+                    // that names someone without saying more lets them see the server.
+                    ->booleanNode('can_read')->defaultTrue()->end()
+                    ->booleanNode('can_access')->defaultFalse()->end()
+                    ->booleanNode('can_edit')->defaultFalse()->end()
+                ->end()
+            ->end()
+            ->defaultValue([]);
+
+        return $node;
+    }
+
+    private function addOAuthNode(ArrayNodeDefinition $node): void
+    {
+        $node->children()
+            ->arrayNode('oauth')
+                ->addDefaultsIfNotSet()
+                ->info(
+                    'Embedded OAuth 2.1 authorization server (experimental; opt-in). '
+                    . 'Isolated from the application\'s global security configuration.'
+                )
+                ->children()
+                    ->booleanNode('enabled')
+                        ->info('Master switch for the embedded OAuth authorization server. Default off.')
+                        ->defaultFalse()
+                    ->end()
+                    ->scalarNode('issuer')
+                        ->info(
+                            'Issuer identifier (iss) advertised in metadata, returned in the '
+                            . 'authorization response, stamped on issued tokens and verified by the '
+                            . 'resource server, e.g. "https://pimcore.example.com". Required once '
+                            . 'oauth.enabled is true.'
+                        )
+                        ->defaultNull()
+                        // Present is not the same as usable. Everything downstream concatenates a
+                        // root path onto this value and compares the result byte for byte, so a
+                        // trailing slash, a path, a query or an uppercase host produces URIs that
+                        // look plausible and never match. Checked on this node rather than on
+                        // `oauth` because for a node whose whole value is an `%env()%` placeholder,
+                        // Symfony validates a typed dummy value instead of the placeholder string:
+                        // the `env(NAME)` default parameter if one is defined, '' otherwise. The
+                        // parent node would see the placeholder string, which is never an origin.
+                        // '' is therefore left to the required check below. The value the variable
+                        // holds at runtime is not checked.
+                        ->validate()
+                            ->ifTrue(static fn (mixed $issuer): bool => $issuer !== null && $issuer !== ''
+                                && (!is_string($issuer) || !CanonicalUri::isCanonicalOrigin($issuer)))
+                            ->thenInvalid(self::OAUTH_ISSUER_INVALID_ERROR)
+                        ->end()
+                    ->end()
+                    ->integerNode('access_token_ttl')
+                        ->info('Access-token lifetime in seconds.')
+                        ->defaultValue(3600)
+                    ->end()
+                    ->integerNode('auth_code_ttl')
+                        ->info('Authorization-code lifetime in seconds.')
+                        ->defaultValue(600)
+                    ->end()
+                    ->integerNode('refresh_token_ttl')
+                        ->info('Refresh-token lifetime in seconds.')
+                        ->defaultValue(2592000)
+                    ->end()
+                    ->scalarNode('consent_path')
+                        ->info('Studio UI route the authorize endpoint redirects to for login/consent.')
+                        ->defaultValue('/pimcore-studio/oauth/consent')
+                    ->end()
+                    ->booleanNode('allow_localhost_loopback_redirect')
+                        ->info(
+                            'Also accept http://localhost:{port} loopback redirect URIs (any port), alongside the '
+                            . 'RFC 8252 IP literals 127.0.0.1/[::1]. RFC 8252 marks "localhost" as NOT RECOMMENDED, '
+                            . 'but some native clients use it; see '
+                            . 'https://github.com/anthropics/claude-code/issues/42765. Set to false to require IP '
+                            . 'literals (RFC-strict).'
+                        )
+                        ->defaultTrue()
+                    ->end()
+                    ->arrayNode('cors_allowed_origins')
+                        ->info(
+                            'Browser origins allowed to call the OAuth endpoints cross-origin (discovery, '
+                            . 'token, register). Empty = any origin (wildcard); list to restrict. Credentials '
+                            . 'are never sent, so a wildcard stays CORS-valid.'
+                        )
+                        ->scalarPrototype()->end()
+                        ->defaultValue([])
+                    ->end()
+                    ->append($this->addOAuthClientCredentialsNode())
+                    ->append($this->addOAuthClientIdMetadataDocumentsNode())
+                    ->append($this->addOAuthDynamicClientRegistrationNode())
+                    ->arrayNode('keys')
+                        ->addDefaultsIfNotSet()
+                        ->info('Signing/encryption key material. Reference via env vars; never commit secrets.')
+                        ->children()
+                            ->scalarNode('private_key')
+                                ->info('Path or contents of the JWT signing private key.')
+                                ->defaultNull()
+                            ->end()
+                            ->scalarNode('public_key')
+                                ->info('Path or contents of the JWT signing public key.')
+                                ->defaultNull()
+                            ->end()
+                            ->scalarNode('passphrase')
+                                ->info('Passphrase for the private key, if any.')
+                                ->defaultNull()
+                            ->end()
+                            ->scalarNode('encryption_key')
+                                ->info('Encryption key for auth codes and refresh tokens.')
+                                ->defaultNull()
+                            ->end()
+                        ->end()
+                    ->end()
+                    ->arrayNode('clients')
+                        ->info(
+                            'Pre-registered public clients (e.g. Studio MCP, Pimcore Agent). Each '
+                            . 'authenticates a logged-in user via the authorization_code + PKCE flow; '
+                            . 'no secret and no client_credentials. Active regardless of the '
+                            . 'dynamic_client_registration / client_id_metadata_documents toggles, so '
+                            . 'these are the onboarding path when both self-registration mechanisms '
+                            . 'are off. The map key is the client_id.'
+                        )
+                        ->useAttributeAsKey('identifier')
+                        ->normalizeKeys(false)
+                        ->arrayPrototype()
+                            ->children()
+                                ->scalarNode('name')->isRequired()->cannotBeEmpty()->end()
+                                ->arrayNode('redirect_uris')
+                                    ->info('Exact-match allow-list of redirect URIs for this client.')
+                                    ->isRequired()
+                                    ->requiresAtLeastOneElement()
+                                    ->scalarPrototype()->cannotBeEmpty()->end()
+                                ->end()
+                            ->end()
+                        ->end()
+                    ->end()
+                    ->arrayNode('resources')
+                        ->info('Protected resources (audiences). Each entry is one endpoint bound as a token audience.')
+                        ->arrayPrototype()
+                            ->children()
+                                ->scalarNode('uri')
+                                    ->isRequired()
+                                    ->info('Canonical resource URI (audience).')
+                                ->end()
+                                ->arrayNode('scopes_supported')
+                                    ->info(
+                                        'Scopes a token for this resource may carry. These are also what '
+                                        . 'the server advertises as its catalogue, so an entry here is how '
+                                        . 'a scope comes to exist at all. Empty constrains nothing.'
+                                    )
+                                    ->scalarPrototype()->end()
+                                    ->defaultValue([])
+                                ->end()
+                                ->arrayNode('authorization_servers')
+                                    ->scalarPrototype()->end()
+                                    ->defaultValue([])
+                                ->end()
+                            ->end()
+                        ->end()
+                    ->end()
+                ->end()
+                // Fail at container build time rather than shipping an issuer that is
+                // advertised but never stamped: with a null issuer the metadata endpoint
+                // still derives one from the request while token issuance omits `iss`
+                // entirely, and EmbeddedTokenValidator then drops its IssuedBy constraint
+                // - a check the documentation promises, silently disabled.
+                ->validate()
+                    ->ifTrue(static fn (array $oauth): bool => ($oauth['enabled'] ?? false) === true
+                        && in_array($oauth['issuer'] ?? null, [null, ''], true))
+                    ->thenInvalid(self::OAUTH_ISSUER_REQUIRED_ERROR)
+                ->end()
+                // Same shape, same reason: enabling the server without key material leaves
+                // it unable to build at all, and AuthorizeController only catches
+                // OAuthServerException, so MissingKeyMaterialException escapes uncaught on a
+                // public unauthenticated path. `passphrase` stays optional - a key without
+                // one is normal.
+                ->validate()
+                    ->ifTrue(static fn (array $oauth): bool => ($oauth['enabled'] ?? false) === true
+                        && self::hasMissingOAuthKey($oauth['keys'] ?? []))
+                    ->thenInvalid(self::OAUTH_KEYS_REQUIRED_ERROR)
+                ->end()
+            ->end()
+        ->end();
+    }
+
+    /**
+     * @param array<string, mixed> $keys
+     */
+    private static function hasMissingOAuthKey(array $keys): bool
+    {
+        foreach (['private_key', 'public_key', 'encryption_key'] as $key) {
+            if (($keys[$key] ?? null) === null) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function addOAuthClientCredentialsNode(): ArrayNodeDefinition
+    {
+        $node = (new TreeBuilder('client_credentials'))->getRootNode();
+        $node
+            ->addDefaultsIfNotSet()
+            ->info(
+                'OAuth client_credentials grant for confidential clients bound to a service user. '
+                . 'The token is issued for the bound service user, without a refresh token. '
+                . 'Dynamically registered and CIMD clients never get this grant. Opt-in; default off.'
+            )
+            ->children()
+                ->booleanNode('enabled')
+                    ->info('Enable the grant at the token endpoint and advertise it in metadata.')
+                    ->defaultFalse()
+                ->end()
+                ->integerNode('access_token_ttl')
+                    ->info('Access-token lifetime in seconds for this grant. Keep it short.')
+                    ->min(60)
+                    ->defaultValue(900)
+                ->end()
+            ->end();
+
+        return $node;
+    }
+
+    private function addOAuthClientIdMetadataDocumentsNode(): ArrayNodeDefinition
+    {
+        $node = (new TreeBuilder('client_id_metadata_documents'))->getRootNode();
+        $node
+            ->addDefaultsIfNotSet()
+            ->info(
+                'Client ID Metadata Documents (CIMD): accept an HTTPS URL as the client_id and '
+                . 'fetch the client metadata from it, instead of pre-registration. No registration '
+                . 'endpoint is exposed. Opt-in; default off.'
+            )
+            ->children()
+                ->booleanNode('enabled')
+                    ->info('Resolve URL-form client_ids and advertise support in metadata.')
+                    ->defaultFalse()
+                ->end()
+                ->arrayNode('allowed_hosts')
+                    ->info('If non-empty, a client_id URL must be hosted on one of these hosts.')
+                    ->scalarPrototype()->end()
+                    ->defaultValue([])
+                ->end()
+                ->booleanNode('allow_insecure')
+                    ->info(
+                        'Dev only: permit http and private/loopback client_id URLs. '
+                        . 'Never enable in production.'
+                    )
+                    ->defaultFalse()
+                ->end()
+                ->integerNode('cache_ttl')
+                    ->info('Seconds to cache a fetched client metadata document.')
+                    ->defaultValue(300)
+                ->end()
+            ->end();
+
+        return $node;
+    }
+
+    private function addOAuthDynamicClientRegistrationNode(): ArrayNodeDefinition
+    {
+        $node = (new TreeBuilder('dynamic_client_registration'))->getRootNode();
+        $node
+            ->addDefaultsIfNotSet()
+            ->info(
+                'RFC 7591 Dynamic Client Registration. Exposes an open (unauthenticated) '
+                . 'registration endpoint so clients without prior credentials can self-register. '
+                . 'Opt-in; default off.'
+            )
+            ->children()
+                ->booleanNode('enabled')
+                    ->info('Expose POST /pimcore-oauth/register and advertise it in metadata.')
+                    ->defaultFalse()
+                ->end()
+            ->end();
+
+        return $node;
+    }
+
     private function addDefaultFromEmail(ArrayNodeDefinition $node): void
     {
         $node->children()
                 ->scalarNode('studio_from_default_email')
                     ->defaultValue('studio-admin@pimcore.com')
                     ->cannotBeEmpty()
+                ->end()
+            ->end();
+    }
+
+    private function addDocumentsNode(ArrayNodeDefinition $node): void
+    {
+        $node->children()
+            ->arrayNode('documents')
+                ->addDefaultsIfNotSet()
+                ->children()
+                    ->arrayNode('default_controllers')
+                        ->info(
+                            'Controller for new page, snippet and email documents created without a predefined '
+                            . 'document type, keyed by document type. A type without an entry uses '
+                            . 'pimcore.documents.default_controller.'
+                        )
+                        ->example(['email' => 'App\\Controller\\MailController::defaultAction'])
+                        ->useAttributeAsKey('type')
+                        ->stringPrototype()
+                            ->cannotBeEmpty()
+                        ->end()
+                        ->validate()
+                            ->ifTrue(static fn (array $controllers): bool => array_diff(
+                                array_keys($controllers),
+                                DocumentTypes::pageSnippetValues()
+                            ) !== [])
+                            ->thenInvalid(sprintf(
+                                self::DOCUMENT_DEFAULT_CONTROLLERS_TYPE_ERROR,
+                                implode(', ', DocumentTypes::pageSnippetValues())
+                            ))
+                        ->end()
+                    ->end()
                 ->end()
             ->end();
     }
@@ -899,6 +1364,27 @@ class Configuration implements ConfigurationInterface
                     ->booleanNode('enabled')
                         ->info('Enable or disable general rate limiting for all Studio API endpoints.')
                         ->defaultTrue()
+                    ->end()
+                ->end()
+            ->end()
+        ->end();
+    }
+
+    private function addTwoFactorAuthenticationNode(ArrayNodeDefinition $node): void
+    {
+        $node->children()
+            ->arrayNode(self::TWO_FACTOR_AUTHENTICATION_NODE)
+                ->addDefaultsIfNotSet()
+                ->info('Google Authenticator settings, shown in the user\'s authenticator app.')
+                ->children()
+                    ->scalarNode('issuer')
+                        ->info('Issuer name in the authenticator app.')
+                        ->cannotBeEmpty()
+                        ->defaultValue('Pimcore')
+                    ->end()
+                    ->scalarNode('server_name')
+                        ->info('Server name in the authenticator app. Defaults to the main domain, if set.')
+                        ->defaultNull()
                     ->end()
                 ->end()
             ->end()

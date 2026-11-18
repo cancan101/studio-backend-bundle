@@ -166,7 +166,7 @@ interface DetailDataInterface
 | `$object` | The data object being loaded for the detail page. |
 | `$value` | The raw stored value from the data object getter. |
 | `$fieldDefinition` | The Pimcore field definition for this field. |
-| `$contextData` | Container context (object brick, localized field, etc.), or `null` for top-level fields. |
+| `$contextData` | Container context (object brick, localized field, etc.), or `null` for top-level fields. `isHistoricalVersion()` is `true` when the data is built for a version detail instead of the edit view, so an adapter that computes its value at hydration time can show what the version stores (see `CalculatedValueAdapter`). |
 
 Return the detail-page-specific representation of the value.
 
@@ -222,6 +222,17 @@ needs custom logic to determine if a value is inherited, overridden, or empty.
 - Container types (localized fields, object bricks, classification stores) that need to
   report inheritance status for their child fields.
 - Field types with non-trivial inheritance semantics.
+
+For every leaf field, return the `InheritanceData` produced by
+`InheritanceServiceInterface::getFieldInheritanceData()`. It resolves the origin object (`objectId`,
+`inherited`), marks the field as `inheritable`, and — when the incoming `FieldContextData` asks for it
+via `shouldResolveInheritedValue()` — carries the normalized `inheritedValue` the field inherits, or
+would inherit, from the nearest ancestor holding a value. Pass that flag on to every
+`FieldContextData` you create for child fields
+(`new FieldContextData(..., resolveInheritedValue: $contextData?->shouldResolveInheritedValue() ?? false)`),
+otherwise the detail response reports `inheritedValue: null` for them. Only construct `InheritanceData`
+yourself when the field cannot take part in inheritance
+(`new InheritanceData($object->getId(), inheritable: false)`).
 
 ```php
 namespace Pimcore\Bundle\StudioBackendBundle\DataObject\Data;

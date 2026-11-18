@@ -13,15 +13,17 @@ declare(strict_types=1);
 
 namespace Pimcore\Bundle\StudioBackendBundle\User\Repository;
 
+use Doctrine\DBAL\ArrayParameterType;
+use Doctrine\DBAL\Connection;
 use Exception;
 use Pimcore\Bundle\StaticResolverBundle\Models\User\UserResolverInterface;
 use Pimcore\Bundle\StudioBackendBundle\Exception\Api\DatabaseException;
 use Pimcore\Bundle\StudioBackendBundle\Exception\Api\NotFoundException;
 use Pimcore\Bundle\StudioBackendBundle\Security\Service\SecurityServiceInterface;
+use Pimcore\Model\Exception\NotFoundException as ModelNotFoundException;
 use Pimcore\Model\User;
 use Pimcore\Model\User\Listing as UserListing;
 use Pimcore\Model\UserInterface;
-use function count;
 use function sprintf;
 
 /**
@@ -29,9 +31,12 @@ use function sprintf;
  */
 final readonly class UserRepository implements UserRepositoryInterface
 {
+    private const array ASSIGNABLE_USER_TYPES = ['user', 'serviceuser'];
+
     public function __construct(
         private SecurityServiceInterface $securityService,
         private UserResolverInterface $userResolver,
+        private Connection $connection,
     ) {
     }
 
@@ -58,6 +63,34 @@ final readonly class UserRepository implements UserRepositoryInterface
         }
 
         return $user;
+    }
+
+    /**
+     * @throws NotFoundException
+     */
+    public function getPersonById(int $userId): UserInterface
+    {
+        $user = $this->getUserById($userId);
+
+        if ($user instanceof User && $user->isServiceUser()) {
+            throw new NotFoundException('User', $userId);
+        }
+
+        return $user;
+    }
+
+    public function getStoredTwoFactorAuthentication(int $userId): array
+    {
+        // Not getUserById(): that answers from the request's runtime cache.
+        $user = new User();
+
+        try {
+            $user->getDao()->getById($userId);
+        } catch (ModelNotFoundException) {
+            throw new NotFoundException('User', $userId);
+        }
+
+        return $user->getTwoFactorAuthentication();
     }
 
     /**
@@ -199,16 +232,11 @@ final readonly class UserRepository implements UserRepositoryInterface
      */
     public function getUsersByNames(array $names): array
     {
-        if (empty($names)) {
+        if ($names === []) {
             return [];
         }
 
-        $listing = new UserListing();
-        $placeholders = implode(',', array_fill(0, count($names), '?'));
-        $listing->setCondition('name IN (' . $placeholders . ') AND type = ?', [...$names, 'user']);
-        $listing->load();
-
-        return $listing->getUsers();
+        return $this->loadAssignableUsers('name', $names, ArrayParameterType::STRING);
     }
 
     /**
@@ -216,15 +244,37 @@ final readonly class UserRepository implements UserRepositoryInterface
      */
     public function getUsersByIds(array $ids): array
     {
-        if (empty($ids)) {
+        if ($ids === []) {
             return [];
         }
 
-        $listing = new UserListing();
-        $placeholders = implode(',', array_fill(0, count($ids), '?'));
-        $listing->setCondition('id IN (' . $placeholders . ') AND type = ?', [...$ids, 'user']);
-        $listing->load();
+        return $this->loadAssignableUsers('id', $ids, ArrayParameterType::INTEGER);
+    }
 
-        return $listing->getUsers();
+    /**
+     * Users and service users matching the values. User\Listing never contains service
+     * users, but permission, role and MCP server access assignments have to find them.
+     *
+     * @param array<int|string> $values
+     *
+     * @return UserInterface[]
+     */
+    private function loadAssignableUsers(string $column, array $values, ArrayParameterType $valueType): array
+    {
+        $ids = $this->connection->fetchFirstColumn(
+            'SELECT id FROM users WHERE ' . $column . ' IN (:values) AND `type` IN (:types) AND id > 0',
+            ['values' => $values, 'types' => self::ASSIGNABLE_USER_TYPES],
+            ['values' => $valueType, 'types' => ArrayParameterType::STRING],
+        );
+
+        $users = [];
+        foreach ($ids as $id) {
+            $user = $this->userResolver->getById((int) $id);
+            if ($user instanceof User) {
+                $users[] = $user;
+            }
+        }
+
+        return $users;
     }
 }

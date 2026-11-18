@@ -33,6 +33,10 @@ use Symfony\Component\Security\Http\Authenticator\Passport\SelfValidatingPasspor
 use function in_array;
 use function is_numeric;
 use function max;
+use function preg_match;
+use function str_starts_with;
+use function substr;
+use function trigger_deprecation;
 
 /**
  * Authenticates MCP requests via Personal Access Tokens (config-based).
@@ -40,6 +44,9 @@ use function max;
  * Validates `Authorization: Bearer <token>` headers against
  * the `pimcore_studio_backend.mcp.authentication.tokens` configuration,
  * which maps Pimcore usernames to token lists.
+ *
+ * @deprecated since 2026.4, to be removed in 2027.1. Use OAuth (authorization_code for people,
+ *             client_credentials for service users) or MCP access tokens instead.
  *
  * @internal
  */
@@ -51,6 +58,8 @@ class PatAuthenticator extends AbstractAuthenticator
 
     private const int BEARER_PREFIX_LENGTH = 7;
 
+    private const string JWT_PATTERN = '/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u';
+
     private const int SECONDS_PER_MINUTE = 60;
 
     /**
@@ -58,6 +67,13 @@ class PatAuthenticator extends AbstractAuthenticator
      * constant from SECONDS_PER_MINUTE despite the equal value - they mean different things.
      */
     private const int FALLBACK_RETRY_AFTER_SECONDS = 60;
+
+    /**
+     * Mirrors the deprecation set on the `mcp.authentication.tokens` configuration node.
+     */
+    private const string DEPRECATION_MESSAGE = 'Static MCP personal access tokens are deprecated and will be removed '
+        . 'in 2027.1. Use OAuth (authorization_code for people, client_credentials for service users) '
+        . 'or MCP access tokens.';
 
     /**
      * @param array<string, list<string>> $tokenMap username => [token, ...]
@@ -81,6 +97,14 @@ class PatAuthenticator extends AbstractAuthenticator
         // authenticator chain does not run PAT validation in parallel — which
         // would override McpAccessTokenAuthenticator's success with a 401.
         if (str_starts_with($authHeader, self::BEARER_PREFIX . McpAccessTokenService::TOKEN_PREFIX)) {
+            return false;
+        }
+
+        // JWT-shaped bearers are OAuth access tokens handled by
+        // OAuthAccessTokenAuthenticator. Decline them for the same reason:
+        // otherwise a PAT failure here would override a successful OAuth login.
+        $token = substr($authHeader, self::BEARER_PREFIX_LENGTH);
+        if (preg_match(self::JWT_PATTERN, $token) === 1) {
             return false;
         }
 
@@ -140,11 +164,18 @@ class PatAuthenticator extends AbstractAuthenticator
         return new SecurityUser($pimcoreUser);
     }
 
+    /**
+     * Raises the deprecation here rather than in authenticate(): this runs only for a token
+     * the map knows and the login throttle has let through, so a request without valid
+     * credentials cannot write deprecation log lines.
+     */
     public function onAuthenticationSuccess(
         Request $request,
         TokenInterface $token,
         string $firewallName
     ): ?Response {
+        trigger_deprecation('pimcore/studio-backend-bundle', '2026.4', self::DEPRECATION_MESSAGE);
+
         return null;
     }
 

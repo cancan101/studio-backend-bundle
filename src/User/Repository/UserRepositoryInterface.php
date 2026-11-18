@@ -32,6 +32,14 @@ interface UserRepositoryInterface
     public function getUserById(int $userId): UserInterface;
 
     /**
+     * Like getUserById(), but a service user is not found: for the user endpoints, which
+     * manage persons only. Service users are managed through the service-user endpoints.
+     *
+     * @throws NotFoundException
+     */
+    public function getPersonById(int $userId): UserInterface;
+
+    /**
      * @throws Exception
      */
     public function deleteUser(UserInterface $user): void;
@@ -45,6 +53,15 @@ interface UserRepositoryInterface
      * @throws DatabaseException
      */
     public function updateUser(UserInterface $user): void;
+
+    /**
+     * The two-factor settings as stored now, past the user already loaded for this request.
+     *
+     * @return array<string, mixed>
+     *
+     * @throws NotFoundException
+     */
+    public function getStoredTwoFactorAuthentication(int $userId): array;
 
     public function getUserListingByRoleId(int $roleId, ?int $excludeUserId = null): UserListing;
 

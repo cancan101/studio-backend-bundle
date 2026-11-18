@@ -32,5 +32,26 @@ final readonly class PublicTranslations
         'forgot-password-form.reset-password',
         'forgot-password-form.back',
         'forgot-password-form.username.placeholder',
+        // Error dialog shown when a login attempt fails
+        'error',
+        'alert-modal.ok-text',
+        // Two-factor code and setup steps, shown before the login is finished
+        'two-factor-form.description',
+        'two-factor-form.code.placeholder',
+        'two-factor-form.code.required',
+        'two-factor-form.code.invalid-format',
+        'two-factor-form.verify',
+        'two-factor-form.error',
+        'two-factor-form.too-many-attempts',
+        'two-factor-form.back',
+        'two-factor-setup-form.description',
+        'two-factor-setup-form.manual-entry',
+        'two-factor-setup-form.confirm',
+        'two-factor-setup-form.load-error',
+        'two-factor-setup-form.expired',
+        // Maintenance mode notice, which can show on the login page
+        'maintenance-mode.locked-out.title',
+        'maintenance-mode.locked-out.text',
+        'maintenance-mode.locked-out.reload',
     ];
 }

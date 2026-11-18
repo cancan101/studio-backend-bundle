@@ -19,6 +19,12 @@ framework:
       policy: 'fixed_window'
       limit: 5
       interval: '5 minutes'
+    # Wrong two-factor codes, keyed on the user and reset only by a correct code - see
+    # CodeAttemptLimiter. A password login does not reset it.
+    studio_two_factor_code:
+      policy: 'fixed_window'
+      limit: 5
+      interval: '5 minutes'
     # Request volume on /pimcore-mcp/, kept separate from studio_api_general because it is
     # sized for machine clients rather than the Studio UI: a single agent server can serve
     # every chat in the installation from one address, so this is a denial-of-service
@@ -27,3 +33,14 @@ framework:
       policy: 'sliding_window'
       limit: 3000
       interval: '1 minute'
+    # Dynamic client registrations on /pimcore-oauth/register, keyed on client IP. Sized
+    # as a denial-of-service ceiling rather than a quota, for the same reason as
+    # studio_mcp_general: a hosted AI connector registers from its provider's egress
+    # range, shared by every customer of that provider, so this bucket is not one
+    # organisation's. Registration is idempotent (ClientRegistrar::register), so repeat
+    # registrations of the same client create no rows and legitimate traffic stays far
+    # below this.
+    studio_oauth_register:
+      policy: 'fixed_window'
+      limit: 60
+      interval: '1 hour'

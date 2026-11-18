@@ -13,17 +13,28 @@ declare(strict_types=1);
 
 namespace Pimcore\Bundle\StudioBackendBundle\EventSubscriber;
 
+use Pimcore\Bundle\StudioBackendBundle\Element\Hydrator\ValidationErrorHydratorInterface;
+use Pimcore\Bundle\StudioBackendBundle\Element\Schema\ValidationError;
+use Pimcore\Bundle\StudioBackendBundle\Element\Schema\ValidationErrorPath;
 use Pimcore\Bundle\StudioBackendBundle\Exception\Api\AbstractApiException;
+use Pimcore\Bundle\StudioBackendBundle\Exception\Api\FieldValidationFailedException;
 use Pimcore\Bundle\StudioBackendBundle\Exception\Api\GdiParsingException;
+use Pimcore\Bundle\StudioBackendBundle\Exception\Api\InvalidArgumentException;
 use Pimcore\Bundle\StudioBackendBundle\Exception\Api\RateLimitException;
 use Pimcore\Bundle\StudioBackendBundle\Util\Trait\StudioBackendPathTrait;
+use Pimcore\Model\Element\ValidationException;
 use Symfony\Component\EventDispatcher\EventSubscriberInterface;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Event\ExceptionEvent;
 use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
+use Symfony\Component\Serializer\Exception\ExtraAttributesException;
 use Symfony\Component\Validator\Exception\ValidationFailedException;
 use function array_key_exists;
+use function array_map;
+use function implode;
+use function in_array;
+use function sprintf;
 
 /**
  * @internal
@@ -32,8 +43,13 @@ final readonly class ApiExceptionSubscriber implements EventSubscriberInterface
 {
     use StudioBackendPathTrait;
 
-    public function __construct(private string $environment, private string $urlPrefix)
-    {
+    private const HIDDEN_VALIDATION_MESSAGE = 'Validation failed';
+
+    public function __construct(
+        private string $environment,
+        private string $urlPrefix,
+        private ValidationErrorHydratorInterface $validationErrorHydrator,
+    ) {
     }
 
     public static function getSubscribedEvents(): array
@@ -47,17 +63,35 @@ final readonly class ApiExceptionSubscriber implements EventSubscriberInterface
     {
         $exception = $event->getThrowable();
         $request = $event->getRequest();
-        $path = $request->getPathInfo();
 
-        // MCP is JSON-RPC and owns its own error shapes, so only the one exception this
-        // bundle raises there is claimed: RateLimitSubscriber's 429, which would otherwise
-        // fall through to Symfony's default error rendering rather than the JSON envelope
-        // every other Studio error uses. Anything else the MCP server produces is left alone.
+        // Decoded once, like the router, so an encoded path that reaches a Studio
+        // controller is still rendered as a Studio error. See the trait for the detail.
+        $path = $this->routedPath($request);
+
+        // RateLimitException wherever it was raised. It is this bundle's own exception and
+        // only this bundle throws it, so the path it happened on says nothing useful: what
+        // matters is that the client gets the JSON envelope and a 429 rather than Symfony's
+        // default error rendering. That covers the MCP endpoints, which are JSON-RPC and own
+        // every other error shape they produce, and the OAuth registration endpoint, which
+        // sits outside the Studio prefix entirely.
+        //
+        // Anything else outside the Studio API is left alone: those responses belong to
+        // whoever serves that path.
         if (
             !$this->isStudioBackendPath($path, $this->urlPrefix)
-            && !($this->isMcpPath($path) && $exception instanceof RateLimitException)
+            && !$exception instanceof RateLimitException
         ) {
             return;
+        }
+
+        if ($exception instanceof ExtraAttributesException) {
+            $exception = new InvalidArgumentException(
+                sprintf(
+                    'The request contains unsupported fields: %s.',
+                    implode(', ', $exception->getExtraAttributes())
+                ),
+                $exception
+            );
         }
 
         if (!$exception instanceof HttpExceptionInterface) {
@@ -86,6 +120,12 @@ final readonly class ApiExceptionSubscriber implements EventSubscriberInterface
 
     private function getResponseData(HttpExceptionInterface $exception): array
     {
+        if ($exception instanceof FieldValidationFailedException
+            && $exception->getPrevious() instanceof ValidationException
+        ) {
+            return $this->handleElementValidationException($exception, $exception->getPrevious());
+        }
+
         if (!$exception instanceof AbstractApiException || !$exception->getMessage()) {
             return [
                 'message' => $exception->getMessage(),
@@ -126,6 +166,68 @@ final readonly class ApiExceptionSubscriber implements EventSubscriberInterface
         return [
             'message' => $message,
             'violations' => $collectedViolations,
+        ];
+    }
+
+    private function handleElementValidationException(
+        FieldValidationFailedException $exception,
+        ValidationException $validationException
+    ): array {
+        $viewableLanguages = $exception->getViewableLanguages();
+        $errors = $this->validationErrorHydrator->hydrate($validationException, $viewableLanguages);
+
+        return [
+            // the aggregated message repeats the entered values, it is not returned when one of them is hidden
+            'message' => $this->containsHiddenError($errors, $viewableLanguages)
+                ? self::HIDDEN_VALIDATION_MESSAGE
+                : $exception->getMessage(),
+            'errorKey' => $exception->getErrorKey(),
+            'validationErrors' => array_map($this->validationErrorToArray(...), $errors),
+        ];
+    }
+
+    /**
+     * @param list<ValidationError> $errors
+     * @param list<string>|null $viewableLanguages
+     */
+    private function containsHiddenError(array $errors, ?array $viewableLanguages): bool
+    {
+        if ($viewableLanguages === null) {
+            return false;
+        }
+
+        foreach ($errors as $error) {
+            foreach ($error->getPath() as $segment) {
+                $language = $segment->getLanguage();
+                if ($language !== null && !in_array($language, $viewableLanguages, true)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private function validationErrorToArray(ValidationError $error): array
+    {
+        return [
+            'field' => $error->getField(),
+            'fieldTitle' => $error->getFieldTitle(),
+            'path' => array_map(
+                static fn (ValidationErrorPath $segment): array => [
+                    'field' => $segment->getField(),
+                    'title' => $segment->getTitle(),
+                    'language' => $segment->getLanguage(),
+                    'index' => $segment->getIndex(),
+                    'type' => $segment->getType(),
+                    'typeTitle' => $segment->getTypeTitle(),
+                ],
+                $error->getPath()
+            ),
+            'message' => $error->getMessage(),
+            'messageKey' => $error->getMessageKey(),
+            // an object, so that empty parameters serialize as {} and not as []
+            'parameters' => (object) $error->getParameters(),
         ];
     }
 
